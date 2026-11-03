@@ -33,6 +33,7 @@ subprocess.run(['java', '-cp', str(helper / 'r8.jar'), 'com.android.tools.r8.D8'
 with zipfile.ZipFile(helper / 'audio-helper.jar', 'w', zipfile.ZIP_DEFLATED) as package:
     package.write(helper / 'classes.dex', 'classes.dex')
 subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--onefile', '--windowed',
+                '--collect-all', 'tkinterdnd2',
                 '--name', 'AndroidIntercom', '--add-data', f'{tools};platform-tools',
                 '--add-data', f'{helper / "audio-helper.jar"};android-helper',
                 '--distpath', str(root / 'dist'), '--workpath', str(root / 'build'),

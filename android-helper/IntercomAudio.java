@@ -1,12 +1,39 @@
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
+import android.media.MediaPlayer;
 import java.io.FileInputStream;
 import java.io.InputStream;
 
 /** Runs under app_process and uses Android's normal AudioFlinger speaker path. */
 public final class IntercomAudio {
     public static void main(String[] args) throws Exception {
+        if (args[0].equals("file")) {
+            MediaPlayer player = new MediaPlayer();
+            try {
+                player.setAudioStreamType(AudioManager.STREAM_MUSIC);
+                player.setDataSource(args[1]);
+                player.prepare();
+                int duration = player.getDuration();
+                long started = System.currentTimeMillis();
+                player.start();
+                System.err.println("MEDIA_READY duration=" + duration);
+                long deadline = System.currentTimeMillis() + Math.max(duration, 0) + 15000L;
+                while (player.isPlaying() || System.currentTimeMillis() - started < Math.min(duration, 300)) {
+                    if (System.currentTimeMillis() > deadline)
+                        throw new IllegalStateException("Media playback timed out");
+                    Thread.sleep(50);
+                }
+                int position = player.getCurrentPosition();
+                long elapsed = System.currentTimeMillis() - started;
+                if (duration > 2000 && elapsed + 1500 < duration)
+                    throw new IllegalStateException("Media ended early: " + position + "/" + duration);
+                System.err.println("MEDIA_DONE position=" + position + " duration=" + duration + " elapsed=" + elapsed);
+            } finally {
+                player.release();
+            }
+            return;
+        }
         int rate = Integer.parseInt(args[0]);
         InputStream input = args.length > 1 ? new FileInputStream(args[1]) : System.in;
         int minimum = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO,

@@ -17,7 +17,8 @@ import sys
 from logging.handlers import RotatingFileHandler
 from transport import find_adb, LocalChannel, run_local
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import numpy as np
 import paramiko
@@ -27,7 +28,44 @@ RATE = 48000
 SERIAL = ''
 
 
-def synthesize(text, target, stop):
+def installed_voices():
+    script = '''
+$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding
+Add-Type -AssemblyName System.Speech
+$s=New-Object System.Speech.Synthesis.SpeechSynthesizer
+try { @($s.GetInstalledVoices() | Where-Object {$_.Enabled} | ForEach-Object {
+ @{name=$_.VoiceInfo.Name; culture=$_.VoiceInfo.Culture.Name}
+}) | ConvertTo-Json -Compress } finally { $s.Dispose() }
+'''
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode:
+        raise RuntimeError('无法读取 Windows 离线语音列表')
+    voices = json.loads(result.stdout.decode('utf-8-sig') or '[]')
+    return voices if isinstance(voices, list) else [voices]
+
+
+class CancelToken:
+    def __init__(self, *events):
+        self.events = events
+
+    def is_set(self):
+        return any(event.is_set() for event in self.events)
+
+    def wait(self, timeout):
+        deadline = time.monotonic() + timeout
+        while not self.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            self.events[0].wait(min(left, .05))
+        return True
+
+
+def synthesize(text, target, stop, voice=None):
     text_path = target.with_suffix('.txt')
     text_path.write_text(text, encoding='utf-8')
     def ps_quote(value):
@@ -37,14 +75,17 @@ $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Speech
 $s=New-Object System.Speech.Synthesis.SpeechSynthesizer
 try {
- $v=$s.GetInstalledVoices() | Where-Object {$_.Enabled -and $_.VoiceInfo.Culture.Name -like 'zh-*'} | Select-Object -First 1
- if (-not $v) { throw 'Chinese voice unavailable. Install a Chinese Windows speech voice.' }
- $s.SelectVoice($v.VoiceInfo.Name)
+ $chosen=VOICE
+ if ($chosen) { $s.SelectVoice($chosen) }
+ else {
+  $v=$s.GetInstalledVoices() | Where-Object {$_.Enabled -and $_.VoiceInfo.Culture.Name -like 'zh-*'} | Select-Object -First 1
+  if ($v) { $s.SelectVoice($v.VoiceInfo.Name) }
+ }
  $f=New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000,[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen,[System.Speech.AudioFormat.AudioChannel]::Stereo)
  $s.SetOutputToWaveFile(TARGET,$f)
  $s.Speak([IO.File]::ReadAllText(TEXT,[Text.Encoding]::UTF8))
 } finally { $s.Dispose() }
-'''.replace('TARGET', ps_quote(target)).replace('TEXT', ps_quote(text_path))
+'''.replace('TARGET', ps_quote(target)).replace('TEXT', ps_quote(text_path)).replace('VOICE', ps_quote(voice or ''))
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
@@ -57,7 +98,7 @@ try {
                 process.wait()
                 raise RuntimeError('语音合成已取消或超时')
         if process.returncode:
-            raise RuntimeError('语音合成失败，请确认 Windows 已安装中文语音包')
+            raise RuntimeError('语音合成失败，请确认所选 Windows 语音可用')
     # tinyplay cannot seek over extended WAV format chunks in a FIFO.
     with wave.open(str(target), 'rb') as source:
         parameters = source.getparams()
@@ -89,6 +130,8 @@ class Intercom:
         self.audio_ready = False
         self.text_jobs = queue.Queue(maxsize=1)
         self.speaking = threading.Event()
+        self.job_cancel = threading.Event()
+        self.cancel_token = CancelToken(self.stop, self.job_cancel)
         self.last_level = 0
 
     def level(self, direction, data):
@@ -100,19 +143,66 @@ class Intercom:
         peak = float(np.max(np.abs(values))) / 32768 if len(values) else 0
         self.report(('level', direction, min(100, peak * 100)))
 
-    def request_text(self, text):
+    def enqueue(self, job):
         if self.speaking.is_set() or not self.text_jobs.empty():
-            raise RuntimeError('正在朗读，请等待完成后再发送')
-        self.text_jobs.put_nowait(text)
+            raise RuntimeError('正在播放，请先停止或等待完成')
+        self.job_cancel.clear()
+        self.text_jobs.put_nowait(job)
 
-    def read_text(self, text):
+    def request_text(self, text, voice=None):
+        self.enqueue(('text', text, voice))
+
+    def request_file(self, filename):
+        path = Path(filename)
+        if path.suffix.lower() not in ('.mp3', '.wav') or not path.is_file():
+            raise RuntimeError('请选择有效的 MP3 或 WAV 音频文件')
+        self.enqueue(('file', str(path.resolve()), None))
+
+    def stop_playback(self):
+        self.job_cancel.set()
+        while not self.text_jobs.empty():
+            try:
+                self.text_jobs.get_nowait()
+            except queue.Empty:
+                break
+
+    def play_file(self, filename):
+        self.speaking.set()
+        path = Path(filename)
+        device_file = '/data/local/tmp/codex-media' + path.suffix.lower()
+        try:
+            if self.cancel_token.is_set():
+                return
+            self.report('正在发送音频：' + path.name)
+            self.push_file(path, device_file)
+            self.report('正在播放文件 → 安卓喇叭：' + path.name)
+            result = self.command(self.player_script('file', device_file) + ' 2>&1', timeout=86400, cancel=True)
+            logging.info('Media playback: %s', result.decode(errors='replace'))
+            if b'MEDIA_DONE' not in result:
+                raise RuntimeError('安卓播放器未确认文件播放完成')
+        except Exception as exc:
+            if self.cancel_token.is_set():
+                self.report('音频播放已停止')
+            else:
+                logging.exception('Audio file playback failed')
+                self.report('文件播放失败：' + str(exc))
+        finally:
+            try:
+                self.cleanup()
+                self.command('rm -f ' + device_file)
+            finally:
+                self.speaking.clear()
+
+    def read_text(self, text, voice=None):
         self.speaking.set()
         try:
-            self.report('正在合成中文语音…')
+            if self.cancel_token.is_set():
+                return
+            self.report('正在合成语音…')
             with tempfile.TemporaryDirectory(prefix='android-tts-') as folder:
                 target = Path(folder) / 'speech.wav'
-                synthesize(text, target, self.stop)
-                if self.stop.is_set():
+                synthesize(text, target, self.cancel_token, voice)
+                if self.cancel_token.is_set():
                     return
                 self.report('正在发送语音到安卓，请稍候…')
                 device_file = '/data/local/tmp/codex-tts.pcm'
@@ -134,8 +224,11 @@ class Intercom:
                     self.cleanup()
                     self.command('rm -f ' + device_file)
         except Exception as exc:
-            logging.exception('Text-to-speech or Android playback failed')
-            self.report('朗读失败：' + str(exc))
+            if self.cancel_token.is_set():
+                self.report('朗读已停止')
+            else:
+                logging.exception('Text-to-speech or Android playback failed')
+                self.report('朗读失败：' + str(exc))
         finally:
             self.speaking.clear()
 
@@ -152,7 +245,7 @@ class Intercom:
                     err.extend(ch.recv_stderr(65536))
                 if ch.exit_status_ready() and not ch.recv_ready() and not ch.recv_stderr_ready():
                     break
-                if cancel and self.stop.is_set():
+                if cancel and self.cancel_token.is_set():
                     raise RuntimeError('连接已取消')
                 if time.monotonic() > end:
                     raise RuntimeError('远程命令超时，请检查主机网络或软件源')
@@ -175,7 +268,7 @@ class Intercom:
 
     def adb(self, args, timeout=20, cancel=True):
         if self.direct:
-            return run_local([self.adb_path, *args], self.stop, timeout, cancel)
+            return run_local([self.adb_path, *args], self.cancel_token, timeout, cancel)
         return self.remote(shlex.join(['adb', *args]), timeout=timeout, cancel=cancel)
 
     def push_file(self, local_file, device_file):
@@ -183,24 +276,36 @@ class Intercom:
             self.adb(['-s', self.serial, 'push', str(local_file), device_file], timeout=60)
             return
         remote_file = '/tmp/codex-intercom-' + os.urandom(8).hex()
-        compressed = Path(str(local_file) + '.gz')
-        compressed.write_bytes(gzip.compress(Path(local_file).read_bytes()))
-        try:
-            with self.client.open_sftp() as transfer:
-                transfer.get_channel().settimeout(15)
-                with compressed.open('rb') as source, transfer.file(remote_file + '.gz', 'wb', bufsize=0) as destination:
-                    while not self.stop.is_set():
-                        data = source.read(768)
-                        if not data:
-                            break
-                        destination.write(data)
-            if self.stop.is_set():
-                raise RuntimeError('操作已取消')
-            self.remote('gzip -dc ' + shlex.quote(remote_file + '.gz') + ' > ' + shlex.quote(remote_file))
-            self.adb(['-s', self.serial, 'push', remote_file, device_file], timeout=60)
-        finally:
-            compressed.unlink(missing_ok=True)
-            self.client.exec_command('rm -f ' + shlex.quote(remote_file) + ' ' + shlex.quote(remote_file + '.gz'), timeout=5)
+        with tempfile.TemporaryDirectory(prefix='intercom-transfer-') as folder:
+            compressed = Path(folder) / 'payload.gz'
+            with Path(local_file).open('rb') as source, gzip.open(compressed, 'wb') as target:
+                while not self.cancel_token.is_set():
+                    data = source.read(262144)
+                    if not data:
+                        break
+                    target.write(data)
+            try:
+                size = compressed.stat().st_size
+                sent, last_update = 0, 0
+                with self.client.open_sftp() as transfer:
+                    transfer.get_channel().settimeout(15)
+                    with compressed.open('rb') as source, transfer.file(remote_file + '.gz', 'wb', bufsize=0) as destination:
+                        while not self.cancel_token.is_set():
+                            data = source.read(768)
+                            if not data:
+                                break
+                            destination.write(data)
+                            sent += len(data)
+                            now = time.monotonic()
+                            if now - last_update > .25:
+                                self.report(('transfer', Path(local_file).name, int(sent * 100 / max(size, 1))))
+                                last_update = now
+                if self.cancel_token.is_set():
+                    raise RuntimeError('Transfer cancelled')
+                self.remote('gzip -dc ' + shlex.quote(remote_file + '.gz') + ' > ' + shlex.quote(remote_file))
+                self.adb(['-s', self.serial, 'push', remote_file, device_file], timeout=60)
+            finally:
+                self.client.exec_command('rm -f ' + shlex.quote(remote_file) + ' ' + shlex.quote(remote_file + '.gz'), timeout=5)
 
     def root_args(self, script):
         encoded = base64.b64encode(script.encode('utf-8')).decode('ascii')
@@ -268,6 +373,7 @@ class Intercom:
         if hasattr(self, 'old_play'):
             del self.old_play
         self.stop.clear()
+        self.job_cancel.clear()
         self.talk.clear()
         self.serial = serial
         self.audio_ready = False
@@ -308,7 +414,11 @@ class Intercom:
             self.cleanup()
             while not self.stop.is_set():
                 if not self.text_jobs.empty():
-                    self.read_text(self.text_jobs.get_nowait())
+                    kind, value, voice = self.text_jobs.get_nowait()
+                    if kind == 'file':
+                        self.play_file(value)
+                    else:
+                        self.read_text(value, voice)
                 elif self.talk.is_set():
                     self.transmit(input_device)
                 else:
@@ -445,9 +555,9 @@ def main():
         messagebox.showinfo('对讲工具已运行', '请先关闭其他新版对讲窗口，再重新打开。')
         root.destroy()
         return
-    root = tk.Tk()
-    root.title('安卓实时对讲')
-    root.geometry('720x850')
+    root = TkinterDnD.Tk()
+    root.title('安卓实时对讲 - 音频文件与多语言')
+    root.geometry('760x900')
     root.resizable(False, False)
     events = queue.Queue()
     engine = Intercom(events.put)
@@ -526,6 +636,7 @@ def main():
         elif choices[0].get() and choices[1].get():
             settings = {k: v.get().strip() for k, v in fields.items() if k != 'password'}
             settings['mode'] = mode.get()
+            settings['voice'] = voice_names.get(voice_box.get(), '')
             try:
                 direct = mode.get() == '电脑直连 ADB'
                 port = 22 if direct else int(settings['port'])
@@ -551,8 +662,30 @@ def main():
     talk = tk.Button(frame, text='按住说话（空格键）', bg='#2374ab', fg='white', font=('Microsoft YaHei UI', 16), height=2)
     talk.pack(fill='x', pady=10)
     talk.bind('<ButtonPress-1>', press)
-    ttk.Label(frame, text='输入文字，让安卓喇叭朗读（中文语音，最多 1000 字）：').pack(anchor='w')
-    text_box = tk.Text(frame, height=4, font=('Microsoft YaHei UI', 11), wrap='word')
+    tabs = ttk.Notebook(frame)
+    tabs.pack(fill='both', expand=True, pady=4)
+    tts_tab = ttk.Frame(tabs, padding=8)
+    file_tab = ttk.Frame(tabs, padding=8)
+    tabs.add(tts_tab, text='文字朗读')
+    tabs.add(file_tab, text='MP3 / WAV 文件播放')
+    voice_names = {}
+    voice_row = ttk.Frame(tts_tab)
+    voice_row.pack(fill='x')
+    ttk.Label(voice_row, text='朗读语言 / 语音').pack(side='left')
+    voice_box = ttk.Combobox(voice_row, state='readonly', width=43)
+    voice_box.pack(side='left', fill='x', expand=True, padx=5)
+    voice_box.set('正在读取电脑语音…')
+    def refresh_voices():
+        def worker():
+            try:
+                events.put(('voices', installed_voices(), None))
+            except Exception as exc:
+                events.put(('voices', [], str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+    ttk.Button(voice_row, text='刷新', width=6, command=refresh_voices).pack(side='left')
+    ttk.Button(tts_tab, text='打开 Windows 语音设置（添加其他语言）',
+               command=lambda: os.startfile('ms-settings:speech')).pack(anchor='w', pady=3)
+    text_box = tk.Text(tts_tab, height=3, font=('Microsoft YaHei UI', 11), wrap='word')
     text_box.pack(fill='x', pady=5)
     def speak_text():
         if not connected or not engine.audio_ready:
@@ -564,12 +697,76 @@ def main():
             return
         release()
         try:
-            engine.request_text(text)
+            voice = voice_names.get(voice_box.get())
+            if not voice:
+                messagebox.showinfo('请选择语音', '请等待语音列表读取完成，并选择可用语音。')
+                return
+            engine.request_text(text, voice)
         except (RuntimeError, queue.Full) as exc:
             messagebox.showinfo('请稍候', str(exc))
-    ttk.Button(frame, text='朗读到安卓喇叭', command=speak_text).pack(pady=4)
+    def stop_media():
+        release()
+        engine.stop_playback()
+    tts_buttons = ttk.Frame(tts_tab)
+    tts_buttons.pack(pady=3)
+    ttk.Button(tts_buttons, text='朗读到安卓喇叭', command=speak_text).pack(side='left', padx=5)
+    ttk.Button(tts_buttons, text='停止朗读', command=stop_media).pack(side='left', padx=5)
+    selected_file = tk.StringVar(value='未选择音频文件')
+    file_path = None
+    drop_area = tk.Label(file_tab, text='将 MP3 / WAV 文件拖到这里\n已连接时拖入自动播放',
+                         relief='groove', bg='#e8f2fa', height=3)
+    drop_area.pack(fill='x', pady=5)
+    file_label = ttk.Label(file_tab, textvariable=selected_file, wraplength=680)
+    file_label.pack(fill='x', pady=4)
+    def choose_file():
+        nonlocal file_path
+        name = filedialog.askopenfilename(title='选择音频文件', filetypes=[('MP3 / WAV', '*.mp3 *.wav'), ('MP3', '*.mp3'), ('WAV', '*.wav')])
+        if name:
+            file_path = name
+            selected_file.set(name)
+    def play_selected():
+        if not connected or not engine.audio_ready:
+            messagebox.showinfo('尚未连接', '请先连接安卓设备，等待进入收听状态。')
+            return
+        if not file_path:
+            messagebox.showinfo('请选择文件', '请先拖入或选择 MP3/WAV 文件。')
+            return
+        release()
+        try:
+            engine.request_file(file_path)
+        except (RuntimeError, queue.Full) as exc:
+            messagebox.showinfo('无法播放', str(exc))
+    def drop_file(event):
+        nonlocal file_path
+        paths = root.tk.splitlist(event.data)
+        if len(paths) != 1 or Path(paths[0]).suffix.lower() not in ('.mp3', '.wav') or not Path(paths[0]).is_file():
+            messagebox.showinfo('文件格式', '请每次拖入一个 MP3 或 WAV 文件。')
+            return
+        file_path = paths[0]
+        selected_file.set(file_path)
+        tabs.select(file_tab)
+        if connected and engine.audio_ready:
+            play_selected()
+        return event.action
+    for widget in (root, file_tab, drop_area, file_label):
+        widget.drop_target_register(DND_FILES)
+        widget.dnd_bind('<<Drop>>', drop_file)
+    file_buttons = ttk.Frame(file_tab)
+    file_buttons.pack(pady=6)
+    for label, action in [('选择音频', choose_file), ('播放到安卓', play_selected), ('停止播放', stop_media)]:
+        ttk.Button(file_buttons, text=label, command=action).pack(side='left', padx=5)
+    def save_voice(event=None):
+        try:
+            config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.exists() else {}
+            config['voice'] = voice_names.get(voice_box.get(), '')
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            logging.exception('Could not save speech voice')
+    voice_box.bind('<<ComboboxSelected>>', save_voice)
+    refresh_voices()
     root.bind_all('<ButtonRelease-1>', release)
-    root.bind('<KeyPress-space>', lambda e: press() if root.focus_get() not in [*fields.values(), text_box] else None)
+    root.bind('<KeyPress-space>', lambda e: press() if root.focus_get() not in [*fields.values(), *choices, text_box, voice_box, mode_box] else None)
     root.bind('<KeyRelease-space>', release)
     # Child-to-child focus changes must not cancel a mouse press on the talk button.
     root.bind('<FocusOut>', lambda e: root.after_idle(lambda: release() if root.focus_displayof() is None else None))
@@ -585,6 +782,22 @@ def main():
         nonlocal connected
         while not events.empty():
             msg = events.get_nowait()
+            if isinstance(msg, tuple) and msg[0] == 'voices':
+                previous = voice_names.get(voice_box.get(), saved.get('voice', ''))
+                voice_names.clear()
+                for voice in msg[1]:
+                    voice_names[voice['culture'] + ' — ' + voice['name']] = voice['name']
+                voice_box['values'] = list(voice_names)
+                preferred = next((label for label, name in voice_names.items() if name == previous), None)
+                if not preferred:
+                    preferred = next((label for label in voice_names if label.startswith('zh-')), next(iter(voice_names), ''))
+                voice_box.set(preferred or '没有可用语音')
+                if msg[2]:
+                    status.set(msg[2])
+                continue
+            if isinstance(msg, tuple) and msg[0] == 'transfer':
+                status.set('正在发送文件：' + msg[1] + '  ' + str(msg[2]) + '%')
+                continue
             if isinstance(msg, tuple) and msg[0] == 'level':
                 meters[msg[1]]['value'] = msg[2]
                 continue
