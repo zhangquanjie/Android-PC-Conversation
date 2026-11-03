@@ -1,4 +1,5 @@
 import os
+import base64
 import queue
 import shlex
 import shutil
@@ -37,8 +38,25 @@ def find_adb(report):
     return str(cache)
 
 
+class Base64Stdin:
+    """Incremental encoding; padding is emitted only at EOF, not between PCM blocks."""
+    def __init__(self):
+        self.pending = b''
+
+    def encode(self, data):
+        combined = self.pending + bytes(data)
+        size = len(combined) // 3 * 3
+        self.pending = combined[size:]
+        return base64.b64encode(combined[:size]) + b'\n' if size else b''
+
+    def finish(self):
+        result = base64.b64encode(self.pending) + b'\n' if self.pending else b''
+        self.pending = b''
+        return result
+
+
 class LocalChannel:
-    def __init__(self, args):
+    def __init__(self, args, encode_stdin=False):
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         bufsize=0, creationflags=subprocess.CREATE_NO_WINDOW)
         self.output = queue.Queue()
@@ -46,6 +64,7 @@ class LocalChannel:
         self.pending = bytearray()
         self.timeout = 2
         self.eof = False
+        self.encoder = Base64Stdin() if encode_stdin else None
         def reader():
             try:
                 while True:
@@ -93,14 +112,25 @@ class LocalChannel:
         return self.process.poll() is not None
 
     def sendall(self, data):
+        if self.encoder:
+            data = self.encoder.encode(data)
+        self._write_all(data)
+
+    def _write_all(self, data):
         view = memoryview(data)
-        while view:
-            written = self.process.stdin.write(view)
-            if not written:
-                raise RuntimeError('本机 ADB 音频连接已关闭')
-            view = view[written:]
+        try:
+            while view:
+                written = self.process.stdin.write(view)
+                if not written:
+                    raise RuntimeError('本机 ADB 音频连接已关闭')
+                view = view[written:]
+        except OSError as exc:
+            detail = bytes(self.errors).decode('utf-8', errors='replace')[-1500:]
+            raise RuntimeError('本机 ADB 音频输入管道已关闭：' + detail + ' (' + str(exc) + ')') from exc
 
     def shutdown_write(self):
+        if self.encoder:
+            self._write_all(self.encoder.finish())
         self.process.stdin.close()
 
     def close(self):

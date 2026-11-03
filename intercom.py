@@ -344,12 +344,17 @@ class Intercom:
         return result.encode('utf-8')
 
     def stream(self, script, incoming=False):
+        encode_stdin = self.direct and not incoming
+        if encode_stdin:
+            # Windows adb shell reads stdin in text mode: raw 0x1a truncates the PCM stream.
+            script = ('exec 3<&0; /system/bin/base64 -d <&3 | /system/bin/sh -c '
+                      + shlex.quote(script))
         if incoming:
             args = ['-s', self.serial, 'exec-out', *self.root_args(script)]
         else:
             args = ['-s', self.serial, 'shell', '-T', shlex.join(self.root_args(script))]
         if self.direct:
-            return LocalChannel([self.adb_path, *args])
+            return LocalChannel([self.adb_path, *args], encode_stdin=encode_stdin)
         ch = self.client.get_transport().open_session(timeout=8)
         ch.settimeout(2)
         ch.exec_command(shlex.join(['adb', *args]))
@@ -424,8 +429,11 @@ class Intercom:
                 else:
                     self.receive(output_device)
         except Exception as exc:
-            logging.exception('Intercom session failed')
-            self.report('错误：' + str(exc))
+            if self.stop.is_set():
+                self.report('连接已断开')
+            else:
+                logging.exception('Intercom session failed')
+                self.report('错误：' + str(exc))
         finally:
             if self.audio_ready:
                 try:
@@ -482,6 +490,7 @@ class Intercom:
                 + str(rate) + (' ' + filename if filename else ''))
 
     def transmit(self, device):
+        self.report('正在准备讲话通道，请继续按住按钮…')
         ch = self.stream(self.player_script(RATE))
         try:
             ready = bytearray()
