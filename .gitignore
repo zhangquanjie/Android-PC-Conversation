@@ -1,0 +1,10 @@
+build/
+dist/
+发布/
+platform-tools/
+__pycache__/
+*.pyc
+*.spec
+*.log
+settings.json
+.venv/

@@ -1,0 +1,29 @@
+name: Build Windows EXE
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+      - run: python build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AndroidIntercom-Windows
+          path: dist/AndroidIntercom.exe
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = "v0.4.${{ github.run_number }}"
+          gh release create $tag dist/AndroidIntercom.exe --target '${{ github.sha }}' --title "Android Intercom $tag" --notes "Windows EXE with direct ADB, SSH relay, push-to-talk and Chinese text-to-speech. Includes restart cleanup and focus handling fixes."
