@@ -21,7 +21,7 @@ def find_adb(report):
         return str(cache)
     existing = shutil.which('adb')
     if existing:
-        result = subprocess.run([existing, 'version'], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=8)
+        result = subprocess.run([existing, 'version'], stdin=subprocess.DEVNULL, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=8)
         if b'1.0.32' not in result.stdout and result.returncode == 0:
             return existing
     report('正在下载并安装 Google 官方 ADB 到当前用户目录…')
@@ -79,7 +79,15 @@ class LocalChannel:
         return result
 
     def recv_stderr(self, count):
-        return bytes(self.errors[:count])
+        result = bytes(self.errors[:count])
+        del self.errors[:len(result)]
+        return result
+
+    def recv_stderr_ready(self):
+        return bool(self.errors)
+
+    def recv_ready(self):
+        return bool(self.pending) or not self.output.empty()
 
     def exit_status_ready(self):
         return self.process.poll() is not None

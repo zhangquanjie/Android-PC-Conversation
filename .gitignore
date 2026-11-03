@@ -8,3 +8,6 @@ __pycache__/
 *.log
 settings.json
 .venv/
+android-helper/*.jar
+android-helper/*.dex
+android-helper/classes/

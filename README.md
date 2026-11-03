@@ -17,7 +17,8 @@ Windows 电脑与 Android 设备的按住说话对讲工具，支持电脑直连
 ## 设备要求和限制
 
 - Android 必须启用 ADB 并授权当前连接，具备 root 权限。
-- 音频适配 Rockchip codec 的 `tinycap`、`tinyplay`、`tinymix`：card 0/device 0，麦克风在第一通道、第二通道为回采。不是通用于所有 Android 设备的音频驱动。
+- 录音适配 Rockchip codec 的 `tinycap`、`tinymix`：card 0/device 0，麦克风在第一通道、第二通道为回采。不是通用于所有 Android 设备的录音驱动。
+- 播放使用 Android `AudioTrack`，由系统选择扬声器/耳机路由和功放，不再强制 `SPK`。实测设备的物理喇叭接在系统选择的 `HP` 路由；固定 `SPK` 虽有数字回采信号却无法出声。
 - 兼容 `su 0`、Magisk `su -c`、root adbd，使用绝对路径 `/system/bin/sh` 和设备端辅助脚本避免嵌套命令引号问题。
 - SSH 模式需要主机具备 SFTP、gzip。直连模式不需要 SSH。
 - USB 需安装设备厂商驱动并确认设备上的 USB 调试授权；USB 实物连接尚未在此项目的测试环境中验证。
@@ -29,6 +30,8 @@ Windows 电脑与 Android 设备的按住说话对讲工具，支持电脑直连
 
 日志：`%LOCALAPPDATA%\AndroidIntercom\intercom.log`。日志不录制音频。反馈问题时请附错误信息及两条音量指示的情况。
 
+无控制台 EXE 显式设置子进程标准输入，并强制安装文件日志处理器，避免继承失效句柄或日志为空。`Errno 22` 的具体来源仍需完整调用栈确认；不能只凭错误编号判断声卡故障。
+
 ## 重连修复
 
 - 停止状态不再阻止设备清理命令；退出时停止本工具启动的音频进程并释放声卡。
@@ -36,8 +39,9 @@ Windows 电脑与 Android 设备的按住说话对讲工具，支持电脑直连
 - 按住说话按钮时，窗口内部输入焦点变化不再立即撤销讲话。
 - 收听只复制真实麦克风通道，不把 codec 的播放回采通道当作第二个麦克风。
 - 发送音频按小块传输，避免当前路由链路上较大 SSH 包的阻塞；收听没有数据时明确报错。
+- 讲话前等待系统播放器的 `AUDIO_READY`，完成后记录实际播放帧数。文字朗读也会核对系统播放器的完成确认。
 
-在 Ubuntu 26.04 + Magisk 设备上进行了连续两轮连接、收听、讲话、恢复收听和关闭测试，并检查声卡释放。流式测试音能够在安卓播放回采通道测到。现场物理喇叭音量和听感仍需使用者确认。
+在 Ubuntu 26.04 + Magisk 设备上进行了连续两轮连接、收听、讲话、恢复收听和关闭测试，并检查声卡释放。系统播放器测试语音已由现场使用者确认听到。讲话与文字朗读都已验证实际播放帧数完成。
 
 ## 源码运行与打包
 
@@ -48,6 +52,8 @@ python intercom.py
 python build.py
 ```
 
-打包输出 `dist/AndroidIntercom.exe`。源码模式缺少可用 ADB 时会下载官方工具到当前用户目录。构建脚本与 GitHub Actions 从 Google 下载 platform-tools；每次 main 分支更新会测试、构建并发布 Windows EXE。
+打包输出 `dist/AndroidIntercom.exe`，构建需要 JDK 17。源码模式缺少可用 ADB 时会下载官方工具到当前用户目录。构建脚本从 Google 下载 platform-tools、R8，从 Maven Central 下载 Android 编译接口，编译 `android-helper/IntercomAudio.java` 为 DEX 并内置播放器。每次 main 分支更新会测试、构建并发布 Windows EXE。
+
+源码首次运行前请执行 `python build.py` 生成 `android-helper/audio-helper.jar`，之后可以直接 `python intercom.py`。
 
 GitHub Actions 的自动化测试验证停止后的清理行为，不替代设备声卡和麦克风的现场测试。

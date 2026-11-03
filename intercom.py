@@ -13,6 +13,7 @@ import base64
 import wave
 import gzip
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from transport import find_adb, LocalChannel, run_local
 import tkinter as tk
@@ -47,7 +48,7 @@ try {
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-                                   stdout=subprocess.DEVNULL, stderr=errors,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
                                    creationflags=subprocess.CREATE_NO_WINDOW)
         deadline = time.monotonic() + 90
         while process.poll() is None:
@@ -82,6 +83,7 @@ class Intercom:
         self.adb_path = None
         self.root_kind = None
         self.helper = "/data/local/tmp/codex-intercom-run.sh"
+        self.player = '/data/local/tmp/codex-audio.jar'
         self.thread = None
         self.serial = SERIAL
         self.audio_ready = False
@@ -112,20 +114,27 @@ class Intercom:
                 synthesize(text, target, self.stop)
                 if self.stop.is_set():
                     return
-                self.command('tinymix 11 SPK >/dev/null')
                 self.report('正在发送语音到安卓，请稍候…')
-                device_file = '/data/local/tmp/codex-tts.wav'
+                device_file = '/data/local/tmp/codex-tts.pcm'
                 try:
-                    self.push_file(target, device_file)
+                    with wave.open(str(target), 'rb') as audio:
+                        rate = audio.getframerate()
+                        pcm = audio.readframes(audio.getnframes())
+                    raw = target.with_suffix('.pcm')
+                    raw.write_bytes(pcm)
+                    self.push_file(raw, device_file)
                     if self.stop.is_set():
                         return
                     self.report('正在朗读 → 安卓喇叭')
-                    script = 'echo $$ > /data/local/tmp/codex-ptt-play.pid; exec tinyplay ' + device_file + ' -D 0 -d 0 -p 240 -n 4'
-                    self.command(script, timeout=240, cancel=True)
+                    result = self.command(self.player_script(rate, device_file) + ' 2>&1', timeout=240, cancel=True)
+                    logging.info('TTS playback: %s', result.decode(errors='replace'))
+                    if b'AUDIO_DONE' not in result:
+                        raise RuntimeError('安卓系统播放器未确认完成')
                 finally:
                     self.cleanup()
                     self.command('rm -f ' + device_file)
         except Exception as exc:
+            logging.exception('Text-to-speech or Android playback failed')
             self.report('朗读失败：' + str(exc))
         finally:
             self.speaking.clear()
@@ -208,6 +217,10 @@ class Intercom:
             script = Path(folder) / 'run.sh'
             script.write_text('#!/system/bin/sh\nexport PATH=/system/bin:/system/xbin:/vendor/bin:$PATH\neval "$(printf %s "$1" | /system/bin/base64 -d)"\n', encoding='utf-8', newline='\n')
             self.push_file(script, self.helper)
+        player = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'android-helper' / 'audio-helper.jar'
+        if not player.is_file():
+            raise RuntimeError('缺少 Android 系统播放器，请使用完整新版 EXE')
+        self.push_file(player, self.player)
         for kind, args in [('uid', ['su', '0', '/system/bin/id']),
                            ('magisk', ['su', '-c', '/system/bin/id']),
                            ('adbd', ['/system/bin/id'])]:
@@ -241,9 +254,11 @@ class Intercom:
         # Kill only processes started by this tool, checking the executable first.
         self.command('for n in cap play; do f=/data/local/tmp/codex-ptt-$n.pid; '
                      'if [ -f "$f" ]; then p=$(cat "$f"); '
-                     'case "$(readlink /proc/$p/exe)" in */tinycap|*/tinyplay) '
+                     'exe=$(readlink /proc/$p/exe); ok=0; case "$exe" in */tinycap|*/tinyplay) ok=1;; '
+                     '*/app_process|*/app_process32|*/app_process64) if tr "\\000" " " < /proc/$p/cmdline | grep -q IntercomAudio; then ok=1; fi;; esac; '
+                     'if [ "$ok" = 1 ]; then '
                      'kill "$p" 2>/dev/null; i=0; while kill -0 "$p" 2>/dev/null && [ "$i" -lt 10 ]; do sleep .05; i=$((i+1)); done; '
-                     'case "$(readlink /proc/$p/exe)" in */tinycap|*/tinyplay) kill -9 "$p" 2>/dev/null;; esac;; esac; '
+                     'if [ "$(readlink /proc/$p/exe)" = "$exe" ]; then kill -9 "$p" 2>/dev/null; fi; fi; '
                      'rm -f "$f"; fi; done; rm -f /data/local/tmp/codex-ptt-in; tinymix 12 "MIC OFF" >/dev/null; true')
 
     def start(self, password, input_device, output_device, host='127.0.0.1', port=22, username='root', serial=SERIAL, direct=False):
@@ -287,7 +302,7 @@ class Intercom:
             if state.strip() != 'device':
                 raise RuntimeError('安卓设备未就绪：' + state)
             self.prepare_android()
-            self.command('command -v tinycap; command -v tinyplay; command -v tinymix')
+            self.command('command -v tinycap; command -v /system/bin/app_process; command -v tinymix')
             self.old_play = self.command('tinymix 11').decode().split('>')[-1].split()[0]
             self.audio_ready = True
             self.cleanup()
@@ -315,7 +330,7 @@ class Intercom:
             self.report(None)
 
     def receive(self, device):
-        self.command('tinymix 11 OFF >/dev/null; tinymix 12 "Main Mic" >/dev/null')
+        self.command('tinymix 12 "Main Mic" >/dev/null')
         ch = self.stream('tinycap /proc/self/fd/3 -D 0 -d 0 -c 2 -r 48000 -b 16 -p 240 -n 4 3>&1 >/dev/null & '
                          'p=$!; echo $p > /data/local/tmp/codex-ptt-cap.pid; wait $p', True)
         ch.settimeout(0.25)
@@ -351,18 +366,30 @@ class Intercom:
             finally:
                 ch.close()
 
+    def player_script(self, rate, filename=None):
+        return ('echo $$ > /data/local/tmp/codex-ptt-play.pid; '
+                'CLASSPATH=' + self.player + ' exec /system/bin/app_process /system/bin IntercomAudio '
+                + str(rate) + (' ' + filename if filename else ''))
+
     def transmit(self, device):
-        self.command('tinymix 11 SPK >/dev/null')
-        ch = self.stream('f=/data/local/tmp/codex-ptt-in; rm -f "$f"; mkfifo "$f"; '
-                         'exec 3<&0; cat <&3 > "$f" & '
-                         'echo $$ > /data/local/tmp/codex-ptt-play.pid; '
-                         'exec tinyplay "$f" -D 0 -d 0 -p 240 -n 4')
+        ch = self.stream(self.player_script(RATE))
         try:
-            ch.sendall(wav_header())
+            ready = bytearray()
+            deadline = time.monotonic() + 6
+            while b'AUDIO_READY' not in ready:
+                while ch.recv_stderr_ready():
+                    ready.extend(ch.recv_stderr(4096))
+                if b'AUDIO_READY' in ready:
+                    break
+                if self.stop.is_set() or ch.exit_status_ready() or time.monotonic() > deadline:
+                    raise RuntimeError('安卓系统播放器未就绪：' + ready.decode(errors='replace'))
+                time.sleep(.03)
             with sd.RawInputStream(samplerate=RATE, channels=1, dtype='int16', device=device,
                                    blocksize=480, latency='low') as audio:
                 self.report('正在讲话 → 安卓喇叭 · 松开恢复收听')
                 while self.talk.is_set() and not self.stop.is_set():
+                    if ch.exit_status_ready():
+                        raise RuntimeError('安卓系统播放已中断：' + ch.recv_stderr(4096).decode(errors='replace'))
                     data, _ = audio.read(480)
                     self.level('tx', data)
                     stereo = np.repeat(np.frombuffer(data, dtype='<i2'), 2).tobytes()
@@ -370,6 +397,15 @@ class Intercom:
                     for offset in range(0, len(stereo), 768):
                         ch.sendall(stereo[offset:offset + 768])
             ch.shutdown_write()
+            deadline = time.monotonic() + 2
+            diagnostic = bytearray()
+            while time.monotonic() < deadline and not self.stop.is_set():
+                while ch.recv_stderr_ready():
+                    diagnostic.extend(ch.recv_stderr(4096))
+                if b'AUDIO_DONE' in diagnostic or ch.exit_status_ready():
+                    break
+                time.sleep(.03)
+            logging.info('PTT Android playback: %s', diagnostic.decode(errors='replace'))
         finally:
             try:
                 self.cleanup()
@@ -398,7 +434,7 @@ def main():
     log_dir = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'AndroidIntercom'
     log_dir.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(log_dir / 'intercom.log', maxBytes=500000, backupCount=2, encoding='utf-8')
-    logging.basicConfig(level=logging.INFO, handlers=[handler], format='%(asctime)s %(levelname)s %(message)s')
+    logging.basicConfig(level=logging.INFO, handlers=[handler], format='%(asctime)s %(levelname)s %(message)s', force=True)
     singleton = socket.socket()
     try:
         singleton.bind(('127.0.0.1', 39871))
